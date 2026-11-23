@@ -52,6 +52,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private static bool isStarting = false;
         private static double nextStartAt = 0.0f;
         private static double nextHeartbeatAt = 0.0f;
+        private static readonly int EditorProcessId = System.Diagnostics.Process.GetCurrentProcess().Id;
         // EditorApplication.timeSinceStartup of the first AddressAlreadyInUse on the configured
         // port; 0 when the port binds cleanly. Drives the same-port retry window (#1173).
         private static double _portBusySince = 0.0;
@@ -1174,7 +1175,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     project_name = projectName,
                     unity_version = Application.unityVersion,
                     last_heartbeat = DateTime.UtcNow.ToString("O"),
-                    project_scoped_tools = projectScopedTools
+                    project_scoped_tools = projectScopedTools,
+                    // Lets the server prune this file when the editor is killed and cannot delete it
+                    pid = EditorProcessId,
+                    host = Environment.MachineName
                 };
                 File.WriteAllText(filePath, JsonConvert.SerializeObject(payload), new System.Text.UTF8Encoding(false));
             }

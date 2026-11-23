@@ -62,6 +62,13 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: ARG001
 
 
 @pytest.fixture(autouse=True)
+def isolate_status_dir(monkeypatch, tmp_path):
+    """Keep discovery away from the developer's real ~/.unity-mcp (it prunes stale files)."""
+    if "UNITY_MCP_STATUS_DIR" not in os.environ:
+        monkeypatch.setenv("UNITY_MCP_STATUS_DIR", str(tmp_path / ".unity-mcp-status"))
+
+
+@pytest.fixture(autouse=True)
 def restore_global_config():
     """Restore global config/env mutations between tests."""
     from core.config import config as global_config

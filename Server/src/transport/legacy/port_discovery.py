@@ -15,7 +15,8 @@ import glob
 import json
 import logging
 import os
-from datetime import datetime
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 import socket
 import struct
@@ -30,6 +31,17 @@ class PortDiscovery:
     REGISTRY_FILE = "unity-mcp-port.json"  # legacy single-project file
     DEFAULT_PORT = 6400
     CONNECT_TIMEOUT = 0.3  # seconds, keep this snappy during discovery
+
+    # Stale status pruning: editors that were killed never delete their status file, so the
+    # file keeps claiming a port that another editor may reuse. Set
+    # UNITY_MCP_PRUNE_STALE_STATUS=0 to keep every file.
+    RELOAD_GRACE_SECONDS = 60.0
+    # A port has one listener and a live editor heartbeats every ~0.5 s: an entry that lost
+    # its port to a fresher one and has not heartbeated for this long is dead.
+    PORT_COLLISION_PRUNE_SECONDS = 60.0
+    # An unreachable entry without a pid is only pruned after this long, so long imports,
+    # modal dialogs and compiles that stall the heartbeat are never mistaken for a crash.
+    UNREACHABLE_PRUNE_SECONDS = 30 * 60.0
 
     @staticmethod
     def get_registry_path() -> Path:
@@ -232,16 +244,21 @@ class PortDiscovery:
         """
         instances_by_port: dict[int, tuple[UnityInstanceInfo, datetime]] = {}
         base = PortDiscovery.get_registry_dir()
+        prune = PortDiscovery._pruning_enabled()
+        now = datetime.now(timezone.utc)
 
         # Scan all status files
         status_pattern = str(base / "unity-mcp-status-*.json")
         status_files = glob.glob(status_pattern)
 
+        # Entries that answer on their port (or are reloading), grouped by port below
+        candidates: list[tuple[Path, UnityInstanceInfo, datetime, bool]] = []
+
         for status_file_path in status_files:
             try:
                 status_path = Path(status_file_path)
                 file_mtime = datetime.fromtimestamp(
-                    status_path.stat().st_mtime)
+                    status_path.stat().st_mtime, tz=timezone.utc)
 
                 with status_path.open('r') as f:
                     data = json.load(f)
@@ -265,8 +282,26 @@ class PortDiscovery:
                     try:
                         last_heartbeat = datetime.fromisoformat(
                             heartbeat_str.replace('Z', '+00:00'))
+                        if last_heartbeat.tzinfo is None:
+                            last_heartbeat = last_heartbeat.replace(tzinfo=timezone.utc)
                     except Exception:
                         pass
+
+                freshness = last_heartbeat or file_mtime
+                age_s = (now - freshness).total_seconds()
+
+                # Killed editor: its process is gone (status files written with a pid on this host)
+                if prune and PortDiscovery._is_same_host(data.get('host')) \
+                        and PortDiscovery._is_process_alive(data.get('pid')) is False:
+                    PortDiscovery._prune_status_file(
+                        status_path, project_path, f"process {data.get('pid')} is gone")
+                    continue
+
+                # Deleted project (e.g. a removed worktree or temp project)
+                if prune and PortDiscovery._is_project_gone(project_path):
+                    PortDiscovery._prune_status_file(
+                        status_path, project_path, "project no longer exists")
+                    continue
 
                 # Verify port is actually responding
                 is_alive = PortDiscovery._try_probe_unity_mcp(
@@ -274,29 +309,15 @@ class PortDiscovery:
 
                 if not is_alive:
                     # If Unity says it's reloading and the status is fresh, don't drop the instance.
-                    freshness = last_heartbeat or file_mtime
-                    now = datetime.now()
-                    if freshness.tzinfo:
-                        from datetime import timezone
-                        now = datetime.now(timezone.utc)
-
-                    age_s = (now - freshness).total_seconds()
-
-                    if is_reloading and age_s < 60:
+                    if is_reloading and age_s < PortDiscovery.RELOAD_GRACE_SECONDS:
                         pass  # keep it, status="reloading"
                     else:
                         logger.debug(
                             f"Instance {project_name}@{hash_value} has heartbeat but port {port} not responding")
-                        continue
-
-                freshness = last_heartbeat or file_mtime
-
-                existing = instances_by_port.get(port)
-                if existing:
-                    _, existing_time = existing
-                    if existing_time >= freshness:
-                        logger.debug(
-                            f"Skipping stale status entry {status_path.name} in favor of more recent data for port {port}")
+                        if prune and age_s > PortDiscovery.UNREACHABLE_PRUNE_SECONDS:
+                            PortDiscovery._prune_status_file(
+                                status_path, project_path,
+                                f"port {port} not responding for {age_s:.0f}s")
                         continue
 
                 # Create instance info
@@ -312,15 +333,33 @@ class PortDiscovery:
                     unity_version=data.get('unity_version'),
                     project_scoped_tools=data.get('project_scoped_tools', False),
                 )
-
-                instances_by_port[port] = (instance, freshness)
-                logger.debug(
-                    f"Discovered Unity instance: {instance.id} on port {instance.port}")
+                candidates.append((status_path, instance, freshness, is_reloading))
 
             except Exception as e:
                 logger.debug(
                     f"Failed to parse status file {status_file_path}: {e}")
                 continue
+
+        # One listener per port: the freshest heartbeat owns it, older claims are stale
+        for status_path, instance, freshness, is_reloading in sorted(
+                candidates, key=lambda item: item[2], reverse=True):
+            existing = instances_by_port.get(instance.port)
+            if existing:
+                logger.debug(
+                    f"Skipping stale status entry {status_path.name} in favor of more recent data for port {instance.port}")
+                age_s = (now - freshness).total_seconds()
+                if prune and not is_reloading and age_s > PortDiscovery.PORT_COLLISION_PRUNE_SECONDS:
+                    PortDiscovery._prune_status_file(
+                        status_path, instance.path,
+                        f"port {instance.port} now belongs to {existing[0].id}")
+                continue
+
+            instances_by_port[instance.port] = (instance, freshness)
+            logger.debug(
+                f"Discovered Unity instance: {instance.id} on port {instance.port}")
+
+        if prune:
+            PortDiscovery._prune_orphan_port_files(base)
 
         deduped_instances = [entry[0] for entry in sorted(
             instances_by_port.values(), key=lambda item: item[1], reverse=True)]
@@ -328,3 +367,95 @@ class PortDiscovery:
         logger.info(
             f"Discovered {len(deduped_instances)} Unity instances (after de-duplication by port)")
         return deduped_instances
+
+    # STALE FILE PRUNING
+
+    @staticmethod
+    def _pruning_enabled() -> bool:
+        return os.environ.get("UNITY_MCP_PRUNE_STALE_STATUS", "1").strip().lower() not in ("0", "false", "no", "off")
+
+    @staticmethod
+    def _is_same_host(host) -> bool:
+        """Whether the status file was written on this machine (pids are only meaningful there)."""
+        if not isinstance(host, str) or not host.strip():
+            return False
+        local = socket.gethostname()
+        return host.strip().split('.')[0].lower() == local.split('.')[0].lower()
+
+    @staticmethod
+    def _is_project_gone(project_path: str) -> bool:
+        """The project folder was deleted while its parent folder still exists.
+
+        Requiring the parent avoids pruning when the server simply cannot see the editor's
+        filesystem (e.g. running in a container).
+        """
+        if not project_path:
+            return False
+        root = project_path.rstrip('/\\')
+        if root.endswith('Assets'):
+            root = root[:-6].rstrip('/\\')
+        if not root:
+            return False
+        return not os.path.isdir(root) and os.path.isdir(os.path.dirname(root))
+
+    @staticmethod
+    def _is_process_alive(pid) -> bool | None:
+        """True / False when the editor process can be checked, None when unknown.
+
+        Status files from older Unity packages carry no pid. Windows is not probed:
+        os.kill(pid, 0) terminates the process there instead of testing it.
+        """
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
+        if sys.platform == "win32":
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return None
+        return True
+
+    @staticmethod
+    def _prune_status_file(status_path: Path, project_path: str, reason: str) -> None:
+        """Delete a dead editor's status file, and its port file when the project is gone."""
+        try:
+            status_path.unlink()
+            logger.info(f"Pruned stale Unity status file {status_path.name}: {reason}")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.debug(f"Could not prune {status_path.name}: {exc}")
+            return
+
+        # The port file is the project's saved port preference: keep it while the project exists
+        if PortDiscovery._is_project_gone(project_path):
+            hash_value = status_path.stem.replace('unity-mcp-status-', '')
+            port_path = status_path.with_name(f"unity-mcp-port-{hash_value}.json")
+            try:
+                port_path.unlink()
+                logger.info(f"Pruned port file {port_path.name}: project no longer exists")
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug(f"Could not prune {port_path.name}: {exc}")
+
+    @staticmethod
+    def _prune_orphan_port_files(base: Path) -> None:
+        """Delete per-project port files whose project no longer exists."""
+        for path_str in glob.glob(str(base / "unity-mcp-port-*.json")):
+            port_path = Path(path_str)
+            try:
+                with port_path.open('r') as f:
+                    project_path = json.load(f).get('project_path', '')
+            except (OSError, ValueError):
+                continue
+            if PortDiscovery._is_project_gone(project_path):
+                try:
+                    port_path.unlink()
+                    logger.info(f"Pruned port file {port_path.name}: project no longer exists")
+                except OSError as exc:
+                    logger.debug(f"Could not prune {port_path.name}: {exc}")
