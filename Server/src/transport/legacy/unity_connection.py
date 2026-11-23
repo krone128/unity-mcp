@@ -311,7 +311,9 @@ class UnityConnection:
                         if status_path.stem.endswith(target_hash):
                             with status_path.open('r') as f:
                                 return json.load(f)
-                # Fallback: return most recent regardless of hash
+                    # Another project's status says nothing about this instance
+                    return None
+                # No instance pinned: return most recent regardless of hash
                 with status_files[0].open('r') as f:
                     return json.load(f)
             except FileNotFoundError:
@@ -450,11 +452,16 @@ class UnityConnection:
                             logger.debug(
                                 f"Rediscovered instance {self.instance_id} on port {new_port}")
                         else:
+                            # Keep the last known port: the instance is usually mid domain
+                            # reload. Never fall back to the port scan here, it returns
+                            # whichever editor heartbeated last and would route this command
+                            # to another project.
+                            new_port = self.port
                             logger.warning(
-                                f"Instance {self.instance_id} not found during reconnection; falling back to port scan",
+                                f"Instance {self.instance_id} not found during reconnection; retrying its last known port {self.port}",
                             )
 
-                    # Fallback to registry default if instance-specific discovery failed
+                    # No instance pinned: fall back to registry default
                     if new_port is None:
                         new_port = stdio_port_registry.get_port(
                             self.instance_id)
